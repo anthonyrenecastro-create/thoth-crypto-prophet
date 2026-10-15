@@ -1,0 +1,6 @@
+{
+  "name": "Crypto World-Model & Market Oracle",
+  "description": "A Resilient Crypto World-Model Substrate utilizing Coinbase API, multi-mechanism market arbitration, live macro indicators, and Gemini LLM Analyst",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
