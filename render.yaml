@@ -1,0 +1,22 @@
+services:
+  - type: web
+    name: thoth-crypto-prophet
+    runtime: node
+    repo: https://github.com/anthonyrenecastro-create/thoth-crypto-prophet
+    branch: main
+    buildCommand: npm ci && npm run build
+    startCommand: npm start
+    healthCheckPath: /api/health
+    envVars:
+      - key: NODE_VERSION
+        value: "20"
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: COINBASE_API_KEY
+        sync: false
+      - key: STRIPE_SECRET_KEY
+        sync: false
+      - key: STRIPE_PRICE_ID
+        sync: false
+      - key: STRIPE_WEBHOOK_SECRET
+        sync: false
