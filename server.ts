@@ -32,6 +32,126 @@ const geminiLimiter = rateLimit({
 app.use('/api/', apiLimiter);
 app.use('/api/gemini/', geminiLimiter);
 
+// ---------------------------------------------------------------------------
+// Paywall: Stripe subscription gate ($49.99/mo, Cryptocurrency Augury Prism)
+// ---------------------------------------------------------------------------
+// Flow: axiomzetainnovations.com "Subscribe" button -> Stripe payment link ->
+// success redirect to /welcome?session_id=... -> server verifies the checkout
+// session with Stripe -> sets a signed httpOnly cookie -> app unlocked.
+// Without a valid subscription cookie, the SPA and /api/* return 402.
+import Stripe from 'stripe';
+import { parseCookie, stringifySetCookie } from 'cookie';
+import crypto from 'crypto';
+
+const stripeSecretKey = process.env.STRIPE_SECRET_KEY || '';
+const stripePriceId = process.env.STRIPE_PRICE_ID || '';
+const stripe = stripeSecretKey ? new Stripe(stripeSecretKey) : null;
+
+// Sign cookies so they can't be forged client-side. In production this MUST
+// be a long random value; it is never exposed to the browser.
+const COOKIE_SECRET = process.env.COOKIE_SECRET || 'dev-only-insecure-secret-change-me';
+const ACCESS_COOKIE = 'thoth_access';
+
+function signAccessToken(payload: string): string {
+  return crypto.createHmac('sha256', COOKIE_SECRET).update(payload).digest('hex');
+}
+
+function hasValidAccess(req: express.Request): boolean {
+  try {
+    const cookies = parseCookie(req.headers.cookie || '');
+    const token = cookies[ACCESS_COOKIE];
+    if (!token) return false;
+    const [payload, sig] = token.split('.');
+    if (!payload || !sig) return false;
+    const expected = signAccessToken(payload);
+    if (!crypto.timingSafeEqual(Buffer.from(sig), Buffer.from(expected))) return false;
+    const data = JSON.parse(Buffer.from(payload, 'base64url').toString('utf8'));
+    // Subscription grants 35 days of access; renews on each successful verify.
+    return typeof data.exp === 'number' && data.exp > Date.now();
+  } catch {
+    return false;
+  }
+}
+
+function grantAccess(res: express.Response, customerId: string): void {
+  const payload = Buffer.from(JSON.stringify({
+    sub: customerId,
+    exp: Date.now() + 35 * 24 * 60 * 60 * 1000,
+  })).toString('base64url');
+  const token = `${payload}.${signAccessToken(payload)}`;
+  res.setHeader('Set-Cookie', stringifySetCookie({
+    name: ACCESS_COOKIE,
+    value: token,
+    httpOnly: true,
+    secure: process.env.NODE_ENV === 'production',
+    sameSite: 'lax',
+    path: '/',
+    maxAge: 35 * 24 * 60 * 60,
+  }));
+}
+
+// Verify a Stripe Checkout Session after payment-link success redirect.
+app.get('/api/billing/verify', async (req, res) => {
+  const sessionId = String(req.query.session_id || '');
+  if (!sessionId) return res.status(400).json({ error: 'Missing session_id.' });
+  if (!stripe) return res.status(503).json({ error: 'Billing not configured on this server.' });
+  try {
+    const session = await stripe.checkout.sessions.retrieve(sessionId);
+    const paid = session.payment_status === 'paid';
+    const isSubscription = session.mode === 'subscription';
+    if (!paid || !isSubscription) {
+      return res.status(402).json({ error: 'No active subscription found for this session.' });
+    }
+    // Confirm the session is for the Thoth price (not some other product).
+    const lineItems = await stripe.checkout.sessions.listLineItems(sessionId, { limit: 5 });
+    const priceMatch = lineItems.data.some((li) => li.price?.id === stripePriceId);
+    if (stripePriceId && !priceMatch) {
+      return res.status(402).json({ error: 'This checkout session is not for Thoth Crypto Prophet.' });
+    }
+    grantAccess(res, String(session.customer || session.id));
+    return res.json({ ok: true, message: 'Subscription verified. Welcome to Thoth Crypto Prophet.' });
+  } catch (err: any) {
+    console.error('Billing verify error:', err?.message);
+    return res.status(502).json({ error: 'Could not verify subscription with Stripe.' });
+  }
+});
+
+// Stripe webhook: revoke/extend access on subscription lifecycle events.
+// Configure STRIPE_WEBHOOK_SECRET in Render and point the webhook at
+// POST /api/billing/webhook with events customer.subscription.deleted.
+app.post('/api/billing/webhook', express.raw({ type: 'application/json' }), async (req, res) => {
+  const webhookSecret = process.env.STRIPE_WEBHOOK_SECRET || '';
+  if (!stripe || !webhookSecret) return res.status(503).json({ error: 'Billing not configured.' });
+  const sig = req.headers['stripe-signature'] as string;
+  try {
+    const event = stripe.webhooks.constructEvent(req.body, sig, webhookSecret);
+    if (event.type === 'customer.subscription.deleted') {
+      // Client holds a 35-day cookie; it will naturally expire. For immediate
+      // revocation, track revoked customer IDs here (left as an extension point).
+      console.log('Subscription cancelled:', (event.data.object as any).customer);
+    }
+    return res.json({ received: true });
+  } catch (err: any) {
+    return res.status(400).json({ error: `Webhook signature failed: ${err?.message}` });
+  }
+});
+
+// Gate: everything except health, billing, and the subscribe landing needs access.
+const PUBLIC_PATHS = ['/api/health', '/api/billing/verify', '/api/billing/webhook', '/subscribe', '/welcome'];
+app.use((req, res, next) => {
+  if (PUBLIC_PATHS.some((p) => req.path === p || req.path.startsWith(p + '/'))) return next();
+  if (req.path.startsWith('/assets/')) return next(); // static assets for the gate page
+  if (hasValidAccess(req)) return next();
+  if (req.path.startsWith('/api/')) {
+    return res.status(402).json({
+      error: 'Subscription required.',
+      subscribe_url: '/subscribe',
+      disclaimer: FINANCIAL_DISCLAIMER,
+    });
+  }
+  return res.redirect('/subscribe');
+});
+
 // Shared Gemini Client Instance
 const apiKey = process.env.GEMINI_API_KEY;
 let ai: GoogleGenAI | null = null;
@@ -658,6 +778,48 @@ async function startServer() {
   } else {
     const distPath = path.join(process.cwd(), 'dist');
     app.use(express.static(distPath));
+    // Post-checkout landing: verifies the Stripe session, then enters the app.
+    app.get('/welcome', (req, res) => {
+      const sessionId = String(req.query.session_id || '');
+      res.send(`<!doctype html><html lang="en"><head><meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>Welcome to Thoth Crypto Prophet</title>
+<style>body{background:#0b0f1a;color:#e2e8f0;font-family:system-ui,sans-serif;display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0}
+.card{background:#111827;border:1px solid #1f2937;border-radius:16px;padding:32px;text-align:center;max-width:400px}
+.err{color:#f87171;font-size:14px}</style></head>
+<body><div class="card"><h1>Activating your subscription…</h1><p id="msg" style="color:#94a3b8">Verifying payment with Stripe.</p></div>
+<script>
+const SESSION_ID = ${JSON.stringify(sessionId)};
+fetch('/api/billing/verify?session_id=' + encodeURIComponent(SESSION_ID))
+  .then(r => r.json().then(j => ({ ok: r.ok, j })))
+  .then(({ ok, j }) => {
+    if (ok) { window.location.href = '/'; }
+    else { document.getElementById('msg').innerHTML = '<span class="err">' + (j.error || 'Verification failed.') + '</span>'; }
+  })
+  .catch(() => { document.getElementById('msg').innerHTML = '<span class="err">Could not reach the server. Please try again.</span>'; });
+</script></body></html>`);
+    });
+
+    app.get('/subscribe', (_req, res) => {      const stripePaymentLink = process.env.STRIPE_PAYMENT_LINK || 'https://buy.stripe.com/fZu8wReAUbVd3oa1KF18c0r';
+      res.send(`<!doctype html><html lang="en"><head><meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>Thoth Crypto Prophet — Subscribe</title>
+<style>body{background:#0b0f1a;color:#e2e8f0;font-family:system-ui,sans-serif;display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0;padding:24px}
+.card{max-width:440px;background:#111827;border:1px solid #1f2937;border-radius:16px;padding:32px;text-align:center}
+h1{font-size:22px;margin:0 0 8px}.price{font-size:40px;font-weight:800;color:#fbbf24;margin:12px 0}
+ul{text-align:left;font-size:14px;color:#94a3b8;line-height:1.9;padding-left:20px}
+a.btn{display:inline-block;background:#f59e0b;color:#111827;font-weight:700;padding:14px 32px;border-radius:10px;text-decoration:none;margin-top:16px}
+.disclaimer{font-size:11px;color:#64748b;margin-top:20px;line-height:1.6}</style></head>
+<body><div class="card">
+<h1>Thoth Crypto Prophet</h1>
+<p style="color:#94a3b8;font-size:14px">Market intelligence workbench · Cryptocurrency Augury Prism</p>
+<div class="price">$49.99<span style="font-size:16px;color:#94a3b8">/mo</span></div>
+<ul><li>Live Coinbase market data + 7 mechanism signals</li><li>Honest backtest auditor on real historical candles</li><li>Gemini LLM market analyst</li><li>Cancel anytime</li></ul>
+<a class="btn" href="${stripePaymentLink}">Subscribe — $49.99/mo</a>
+<p class="disclaimer">Not financial advice. Experimental model outputs with no validated predictive edge. Cryptocurrency trading involves substantial risk of loss. Do your own research.</p>
+</div></body></html>`);
+    });
+
     app.get('*', (req, res) => {
       res.sendFile(path.join(distPath, 'index.html'));
     });
