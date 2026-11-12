@@ -84,4 +84,4 @@ Every `/api/gemini/*` response carries the financial disclaimer.
 
 ## License
 
-Proprietary. All rights reserved. (c) Axiom Zeta Innovations LLC.
+Licensed under the GNU AGPL-3.0. (c) Axiom Zeta Innovations LLC.
